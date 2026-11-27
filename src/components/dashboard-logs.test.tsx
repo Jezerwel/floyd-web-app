@@ -46,7 +46,7 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
-// Exact telemetry JSON the Nano ESP32 sketch sends (firmware/FloydFeeder/FloydFeeder.ino).
+// Exact telemetry JSON the feeder sketch sends (firmware/FloydFeeder/FloydFeeder.ino).
 const SKETCH_TELEMETRY = JSON.parse(
   '{"type":"sensor_data","data":{"motorState":"jam_clear","augerSpeed":768,"impellerSpeed":0,' +
     '"augerDirection":"reverse","impellerDirection":"brake","buttonAPressed":false,"buttonBPressed":true}}',

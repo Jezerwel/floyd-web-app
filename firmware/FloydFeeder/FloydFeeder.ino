@@ -1,15 +1,15 @@
 /*
-  Floyd Feeder firmware - Arduino Nano ESP32
+  Floyd Feeder firmware - Seeed Studio XIAO ESP32S3
   ------------------------------------------
   Talks to the Floyd web app over Bluetooth LE (Web Bluetooth).
 
-  Board:     Arduino Nano ESP32 (Boards Manager: "Arduino ESP32 Boards", FQBN arduino:esp32:nano_nora)
+  Board:     XIAO_ESP32S3 (Boards Manager: "esp32" by Espressif Systems, FQBN esp32:esp32:XIAO_ESP32S3)
   Libraries: ArduinoJson v7 (Library Manager). BLE comes with the board package.
 
-  Wiring (H-bridge driver with two enable inputs + one PWM input per motor)
+  Wiring (HC-160A S2 control header; connect XIAO GND to driver G)
     D3 - Impeller Forward Enable (A)     D8 - Auger Forward Enable (a)
     D1 - Impeller Reverse Enable (B)     D9 - Auger Reverse Enable (b)
-    D4 - Impeller PWM                    D5 - Auger PWM
+    D4 - Impeller PWM (PA)               D5 - Auger PWM (Pa)
     D6 - Button A (manual feed / stop)   D7 - Button B (clear jam)
 
   Enable pins:  A=0,B=0 brake | A=1,B=0 forward | A=0,B=1 reverse | A=1,B=1 never driven
@@ -30,7 +30,7 @@
     ...9145 Schedules READ/WRITE  pages: uint16 LE index, uint16 LE total, <=480 bytes JSON
     ...9147 Time      WRITE   uint32 LE Unix seconds [+ int16 LE UTC offset in minutes]
     ...9148 Feed log  NOTIFY  {"type":"control_response","data":{"action":"feed_complete",...}}
-  Speeds on the wire are 0-1023; the sketch maps them to 8-bit PWM.
+  Speeds on the wire are 0-1023; the driver uses 15 kHz PWM up to 98% duty.
 */
 
 #include <Arduino.h>
@@ -38,12 +38,17 @@
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
-#include <BLE2902.h>
 #include <BLESecurity.h>
 #include <Preferences.h>
 #include <sys/time.h>
 #include <time.h>
 #include "FeederTypes.h"
+
+#ifndef ARDUINO_XIAO_ESP32S3
+#error "Select the Seeed Studio XIAO_ESP32S3 board for Floyd Feeder."
+#elif !defined(CONFIG_NIMBLE_ENABLED)
+#error "Use Espressif Arduino ESP32 3.3.13 with NimBLE enabled."
+#endif
 
 // ---------------------------------------------------------------- pins
 const uint8_t PIN_IMPELLER_FWD = D3;  // A
@@ -57,6 +62,9 @@ const uint8_t PIN_BUTTON_B = D7;
 
 // ---------------------------------------------------------------- settings
 const uint16_t PWM_MAX = 1023;                 // web app speed range
+const uint32_t MOTOR_PWM_HZ = 15000;
+const uint8_t MOTOR_PWM_BITS = 10;
+const uint16_t MOTOR_MAX_DUTY = (1u << MOTOR_PWM_BITS) * 98u / 100u;
 const uint16_t FEED_DEFAULT_AUGER = 768;       // 75 %
 const uint16_t FEED_DEFAULT_IMPELLER = 1023;   // 100 %
 const uint32_t FEED_DEFAULT_PRE_MS = 1500;
@@ -100,7 +108,7 @@ void setMotor(Motor& m, Direction dir, uint16_t speed) {
   if (dir == DIR_BRAKE) speed = 0;
   if (speed > PWM_MAX) speed = PWM_MAX;
   if (dir != m.dir) {
-    analogWrite(m.pwmPin, 0);
+    ledcWrite(m.pwmPin, 0);
     digitalWrite(m.fwdPin, LOW);
     digitalWrite(m.revPin, LOW);
     if (m.dir != DIR_BRAKE && dir != DIR_BRAKE) delay(DIRECTION_DEAD_TIME_MS);  // forward <-> reverse
@@ -108,7 +116,7 @@ void setMotor(Motor& m, Direction dir, uint16_t speed) {
     if (dir == DIR_REVERSE) digitalWrite(m.revPin, HIGH);
     m.dir = dir;
   }
-  analogWrite(m.pwmPin, speed >> 2);  // 0-1023 -> 0-255
+  ledcWrite(m.pwmPin, (uint32_t)speed * MOTOR_MAX_DUTY / PWM_MAX);
   m.speed = speed;
 }
 
@@ -250,7 +258,7 @@ void sendStatus() {
   doc["type"] = "status";
   JsonObject data = doc["data"].to<JsonObject>();
   data["connected"] = true;
-  data["firmware"] = "floyd-nano-esp32-1.0";
+  data["firmware"] = "floyd-xiao-esp32s3-1.0";
   data["timeSynced"] = time(nullptr) > TIME_VALID_AFTER;
   sendJson(statusChar, doc);
 }
@@ -524,7 +532,7 @@ void handleCommand(const char* json) {
   } else if (strcmp(action, "get_schedules") == 0) {
     sendControlResponse(action, true);  // the app reads the schedules characteristic
   } else {
-    sendError("This command is not supported by the Nano ESP32 firmware.");
+    sendError("This command is not supported by the Floyd feeder firmware.");
   }
 }
 
@@ -614,14 +622,10 @@ class ScheduleCallbacks : public BLECharacteristicCallbacks {
 };
 
 BLECharacteristic* addCharacteristic(BLEService* service, const char* uuid, uint32_t properties) {
-  BLECharacteristic* c = service->createCharacteristic(uuid, properties);
   if (properties & BLECharacteristic::PROPERTY_WRITE) {
-    esp_gatt_perm_t permissions = ESP_GATT_PERM_WRITE_ENC_MITM;
-    if (properties & BLECharacteristic::PROPERTY_READ) permissions |= ESP_GATT_PERM_READ;
-    c->setAccessPermissions(permissions);
+    properties |= BLECharacteristic::PROPERTY_WRITE_ENC | BLECharacteristic::PROPERTY_WRITE_AUTHEN;
   }
-  if (properties & BLECharacteristic::PROPERTY_NOTIFY) c->addDescriptor(new BLE2902());
-  return c;
+  return service->createCharacteristic(uuid, properties);
 }
 
 class OwnerPairingCallbacks : public BLESecurityCallbacks {
@@ -631,8 +635,9 @@ class OwnerPairingCallbacks : public BLESecurityCallbacks {
   void onPassKeyNotify(uint32_t passkey) override {
     Serial.printf("[ble] Enter this pairing code on your phone: %06lu\n", (unsigned long)passkey);
   }
-  void onAuthenticationComplete(esp_ble_auth_cmpl_t result) override {
-    Serial.println(result.success ? "[ble] Pairing complete" : "[ble] Pairing failed");
+  void onAuthenticationComplete(ble_gap_conn_desc* connection, int status) override {
+    Serial.println(status == 0 && connection->sec_state.authenticated
+      ? "[ble] Pairing complete" : "[ble] Pairing failed");
   }
 };
 
@@ -643,15 +648,14 @@ void setupBle() {
 
   BLEDevice::init(name.c_str());
   BLEDevice::setSecurityCallbacks(new OwnerPairingCallbacks());
-  static BLESecurity security;
-  security.setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
-  security.setCapability(ESP_IO_CAP_OUT);
-  security.setKeySize(16);
-  security.setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
-  security.setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
-  uint8_t requireSecurePairing = ESP_BLE_ONLY_ACCEPT_SPECIFIED_AUTH_ENABLE;
-  ESP_ERROR_CHECK(esp_ble_gap_set_security_param(
-    ESP_BLE_SM_ONLY_ACCEPT_SPECIFIED_SEC_AUTH, &requireSecurePairing, sizeof(requireSecurePairing)));
+  BLESecurity::setAuthenticationMode(true, true, true);  // Bonding, MITM, Secure Connections.
+  ble_hs_cfg.sm_sc_only = 1;
+  BLESecurity::setCapability(ESP_IO_CAP_OUT);
+  BLESecurity::setInitEncryptionKey();
+  BLESecurity::setRespEncryptionKey();
+  BLESecurity::setPassKey(false);
+  BLESecurity::regenPassKeyOnConnect(true);
+  BLESecurity::setForceAuthentication(false);  // Start pairing when the phone tries a protected write.
   BLEDevice::setMTU(517);
   bleServer = BLEDevice::createServer();
   bleServer->setCallbacks(new ServerCallbacks());
@@ -690,21 +694,28 @@ void setupBle() {
 // ---------------------------------------------------------------- setup / loop
 void setup() {
   // Motors off before anything else: enables LOW (brake) and PWM 0.
-  const uint8_t outputs[] = {PIN_IMPELLER_FWD, PIN_IMPELLER_REV, PIN_AUGER_FWD, PIN_AUGER_REV};
+  const uint8_t outputs[] = {
+    PIN_IMPELLER_FWD, PIN_IMPELLER_REV, PIN_IMPELLER_PWM,
+    PIN_AUGER_FWD, PIN_AUGER_REV, PIN_AUGER_PWM,
+  };
   for (uint8_t pin : outputs) {
     pinMode(pin, OUTPUT);
     digitalWrite(pin, LOW);
   }
-  pinMode(PIN_IMPELLER_PWM, OUTPUT);
-  pinMode(PIN_AUGER_PWM, OUTPUT);
-  analogWrite(PIN_IMPELLER_PWM, 0);
-  analogWrite(PIN_AUGER_PWM, 0);
+  Serial.begin(115200);
+  if (!ledcAttach(PIN_IMPELLER_PWM, MOTOR_PWM_HZ, MOTOR_PWM_BITS) ||
+      !ledcAttach(PIN_AUGER_PWM, MOTOR_PWM_HZ, MOTOR_PWM_BITS) ||
+      !ledcWrite(PIN_IMPELLER_PWM, 0) || !ledcWrite(PIN_AUGER_PWM, 0)) {
+    for (;;) {
+      Serial.println("[motor] Could not initialize PWM. Motors remain braked.");
+      delay(1000);
+    }
+  }
   pinMode(PIN_BUTTON_A, INPUT_PULLUP);
   pinMode(PIN_BUTTON_B, INPUT_PULLUP);
 
-  Serial.begin(115200);
   delay(200);
-  Serial.println("\nFloyd Feeder (Nano ESP32)");
+  Serial.println("\nFloyd Feeder (XIAO ESP32S3)");
 
   commandQueue = xQueueCreate(4, sizeof(CommandBuffer));
   prefs.begin("floyd", false);
