@@ -18,7 +18,7 @@ const ROUTE_META: Record<AppRoute, { label: string; description: string }> = {
   },
   logs: {
     label: "Logs",
-    description: "Review sensor readings, alerts, and feed history.",
+    description: "Review feed history.",
   },
 };
 

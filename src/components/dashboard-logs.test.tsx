@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import type { DeviceMessage, Schedule } from "@/protocol";
 import type { FeederTransport, TransportSupport } from "@/transport/transport";
 import { FeederStore } from "@/state/feeder-store";
@@ -46,76 +46,71 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
+// Exact telemetry JSON the Nano ESP32 sketch sends (firmware/FloydFeeder/FloydFeeder.ino).
+const SKETCH_TELEMETRY = JSON.parse(
+  '{"type":"sensor_data","data":{"motorState":"jam_clear","augerSpeed":768,"impellerSpeed":0,' +
+    '"augerDirection":"reverse","impellerDirection":"brake","buttonAPressed":false,"buttonBPressed":true}}',
+) as DeviceMessage;
+
 describe("DashboardView", () => {
-  it("shows valid sensor readings and suppresses out-of-range values", async () => {
+  it("shows motor direction, speed and button state from the sketch telemetry", async () => {
     const transport = new DashboardTransport();
     const store = renderView(<DashboardView />, transport);
     await act(async () => {
       await store.startConnection();
     });
     act(() => {
-      transport.emit({
-        type: "sensor_data",
-        timestamp: 1,
-        data: {
-          temperature: 24.5,
-          foodLevelPercentage: 76,
-          distance: 12.2,
-          temperatureSensorConnected: true,
-          ultrasonicSensorConnected: true,
-          motorState: "idle",
-        },
-      });
+      transport.emit({ ...SKETCH_TELEMETRY, timestamp: 1 });
     });
-    expect(screen.getByText("24.5")).toBeInTheDocument();
-    expect(screen.getByText("76%")).toBeInTheDocument();
 
-    act(() => {
-      transport.emit({
-        type: "sensor_data",
-        timestamp: 2,
-        data: { temperature: 200, foodLevelPercentage: 120 },
-      });
+    const auger = screen.getByRole("article", { name: "Auger motor" });
+    expect(auger).toHaveTextContent("Reverse");
+    expect(auger).toHaveTextContent("75%");
+    const impeller = screen.getByRole("article", { name: "Impeller motor" });
+    expect(impeller).toHaveTextContent("Brake");
+    expect(impeller).toHaveTextContent("0%");
+    expect(screen.getByRole("group", { name: "Button A (feed)" })).toHaveTextContent("Released");
+    expect(screen.getByRole("group", { name: "Button B (clear jam)" })).toHaveTextContent("Pressed");
+    expect(screen.getByText("Unclogging")).toBeInTheDocument();
+    expect(screen.queryByText(/temperature/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/food remaining/i)).not.toBeInTheDocument();
+    store.dispose();
+  });
+
+  it("ignores unknown direction values", async () => {
+    const transport = new DashboardTransport();
+    const store = renderView(<DashboardView />, transport);
+    await act(async () => {
+      await store.startConnection();
     });
-    expect(screen.getAllByText("--").length).toBeGreaterThan(0);
+    act(() => {
+      transport.emit({ type: "sensor_data", timestamp: 1, data: { augerDirection: "sideways", augerSpeed: 5000 } });
+    });
+    const auger = screen.getByRole("article", { name: "Auger motor" });
+    expect(auger).toHaveTextContent("--");
     store.dispose();
   });
 });
 
 describe("LogsView", () => {
-  it("renders sensor, alert, and feed sections and clears sensor logs", async () => {
+  it("shows feed history from completion responses", async () => {
     const transport = new DashboardTransport();
     const store = renderView(<LogsView />, transport);
     await act(async () => {
       await store.startConnection();
     });
+    expect(screen.getByText(/no feed history/i)).toBeInTheDocument();
     act(() => {
-      transport.emit({
-        type: "sensor_data",
-        timestamp: 1,
-        data: {
-          temperature: 35,
-          foodLevelPercentage: 5,
-          distance: 12,
-          temperatureSensorConnected: true,
-          ultrasonicSensorConnected: true,
-          motorState: "idle",
-        },
-      });
       transport.emit({
         type: "control_response",
         timestamp: 2,
-        data: { action: "feed_complete", feedMs: 3000, success: true },
+        data: { action: "feed_complete", augerSpeed: 768, impellerSpeed: 1023, feedMs: 3000, success: true },
       });
     });
-    expect(screen.getByText(/35\.0 °C/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("tab", { name: "Alerts" }));
-    expect(screen.getAllByText(/critical food/i).length).toBeGreaterThan(0);
-    fireEvent.click(screen.getByRole("tab", { name: "Feed history" }));
     expect(screen.getByRole("heading", { name: "Feed history" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("tab", { name: "Sensor data" }));
-    fireEvent.click(screen.getByRole("button", { name: "Clear sensor logs" }));
-    expect(screen.getByText(/no sensor data/i)).toBeInTheDocument();
+    expect(screen.getByText("OK")).toBeInTheDocument();
+    expect(screen.getByText("Auger 75%")).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: /sensor/i })).not.toBeInTheDocument();
     store.dispose();
   });
 });

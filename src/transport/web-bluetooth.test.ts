@@ -9,6 +9,7 @@ import {
   FLOYD_BLE_STATUS,
   FLOYD_BLE_FEEDLOG,
   encodeJson,
+  encodeScheduleChunks,
 } from "@/protocol";
 import type { Schedule } from "@/protocol";
 import { TransportError } from "./errors";
@@ -26,6 +27,7 @@ class FakeCharacteristic implements BluetoothCharacteristicLike {
   readonly uuid: string;
   readonly writes: Uint8Array[] = [];
   value: DataView | undefined;
+  readQueue: Uint8Array[] = [];
   private readonly listeners = new Set<(event: Event) => void>();
 
   constructor(uuid: string, initialValue?: Uint8Array) {
@@ -57,6 +59,8 @@ class FakeCharacteristic implements BluetoothCharacteristicLike {
   }
 
   async readValue(): Promise<DataView> {
+    const queued = this.readQueue.shift();
+    if (queued) return new DataView(queued.buffer, queued.byteOffset, queued.byteLength);
     if (!this.value) throw new Error("No characteristic value");
     return this.value;
   }
@@ -220,6 +224,7 @@ describe("WebBluetoothTransport", () => {
     await fixture.transport.connect();
     await fixture.transport.sendCommand({ action: "ping", timestamp: 1234 });
     await fixture.transport.syncTime(0x12345678);
+    await fixture.transport.syncTime(0x12345678, -300);
 
     expect(JSON.parse(new TextDecoder().decode(fixture.service.characteristic(FLOYD_BLE_COMMAND).writes[0]))).toEqual({
       action: "ping",
@@ -231,6 +236,29 @@ describe("WebBluetoothTransport", () => {
       0x34,
       0x12,
     ]);
+    expect([...fixture.service.characteristic(FLOYD_BLE_TIME).writes[1]]).toEqual([
+      0x78,
+      0x56,
+      0x34,
+      0x12,
+      0xd4,
+      0xfe,
+    ]);
+  });
+
+  it("reads a paged schedule list larger than one BLE attribute", async () => {
+    const schedules = Array.from({ length: 10 }, (_, index) => ({
+      ...schedule,
+      id: `schedule-${index}`,
+      label: `Feeding number ${index}`,
+    }));
+    const pages = encodeScheduleChunks(schedules);
+    expect(pages.length).toBeGreaterThan(1);
+    const fixture = makeFixture(new TextEncoder().encode("[]"));
+    await fixture.transport.connect();
+    // The firmware cursor can start mid-list (for example after an aborted read).
+    fixture.service.characteristic(FLOYD_BLE_SCHEDULES).readQueue = [pages[1], ...pages];
+    expect(await fixture.transport.readSchedules()).toEqual(schedules);
   });
 
   it("reads and writes schedule JSON with chunk framing", async () => {

@@ -66,7 +66,10 @@ class FakeTransport implements FeederTransport {
     await this.commandImplementation(payload);
   }
 
-  async syncTime(): Promise<void> {}
+  readonly timeSyncs: Array<[number, number | undefined]> = [];
+  async syncTime(seconds: number, utcOffsetMinutes?: number): Promise<void> {
+    this.timeSyncs.push([seconds, utcOffsetMinutes]);
+  }
 
   async readSchedules(): Promise<Schedule[]> {
     return [];
@@ -102,12 +105,13 @@ const sensorMessage = (timestamp: number, overrides: Record<string, unknown> = {
   type: "sensor_data",
   timestamp,
   data: {
-    temperature: 24.5,
-    distance: 12.2,
-    foodLevelPercentage: 76,
-    temperatureSensorConnected: true,
-    ultrasonicSensorConnected: true,
-    motorState: "idle",
+    motorState: "feeding",
+    augerSpeed: 768,
+    impellerSpeed: 1023,
+    augerDirection: "forward",
+    impellerDirection: "forward",
+    buttonAPressed: true,
+    buttonBPressed: false,
     ...overrides,
   },
 });
@@ -176,27 +180,19 @@ describe("FeederStore", () => {
     });
 
     expect(store.getSnapshot().deviceData).toMatchObject({
-      temperature: 24.5,
+      motorState: "feeding",
+      augerDirection: "forward",
+      impellerDirection: "forward",
+      buttonAPressed: true,
+      buttonBPressed: false,
       wifiRssi: -55,
       esp32Connected: true,
     });
     expect(store.getSnapshot().schedules).toEqual([schedule]);
-    expect(store.getSnapshot().sensorLogs).toHaveLength(1);
+    const expectedOffset = -new Date(1_700_000_000_000).getTimezoneOffset();
+    expect(transport.timeSyncs[0]).toEqual([1_700_000_000, expectedOffset]);
     expect(store.getSnapshot().feedLogs[0]).toMatchObject({ success: true, feedMs: 3000 });
     expect(storage.getItem("floyd-feedlogs")).toContain('"success":true');
-  });
-
-  it("caps sensor logs at fifty entries and clears them", async () => {
-    const transport = new FakeTransport();
-    const store = new FeederStore({ transport });
-    await store.startConnection();
-    for (let index = 0; index < 51; index += 1) {
-      transport.emitMessage(sensorMessage(index));
-    }
-    expect(store.getSnapshot().sensorLogs).toHaveLength(50);
-    expect(store.getSnapshot().sensorLogs[0].timestamp).toBe(50);
-    store.clearSensorLogs();
-    expect(store.getSnapshot().sensorLogs).toEqual([]);
   });
 
   it("wraps commands in the existing envelope and surfaces failures", async () => {

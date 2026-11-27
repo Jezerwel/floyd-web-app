@@ -109,3 +109,30 @@ export function encodeScheduleChunks(schedules: Schedule[]): Uint8Array[] {
   }
   return chunks;
 }
+
+export interface ScheduleChunk {
+  index: number;
+  total: number;
+  payload: Uint8Array;
+}
+
+/** Splits one schedule read/write page: uint16 LE index, uint16 LE total, JSON bytes. */
+export function decodeScheduleChunk(bytes: Uint8Array): ScheduleChunk | null {
+  if (bytes.length < 4) return null;
+  const header = new DataView(bytes.buffer, bytes.byteOffset, 4);
+  const index = header.getUint16(0, true);
+  const total = header.getUint16(2, true);
+  if (total === 0 || index >= total) return null;
+  return { index, total, payload: bytes.slice(4) };
+}
+
+export function joinScheduleChunks(chunks: readonly ScheduleChunk[]): Uint8Array {
+  const length = chunks.reduce((sum, chunk) => sum + chunk.payload.length, 0);
+  const joined = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk.payload, offset);
+    offset += chunk.payload.length;
+  }
+  return joined;
+}

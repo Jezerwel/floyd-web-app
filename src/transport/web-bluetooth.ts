@@ -10,15 +10,18 @@ import {
   FLOYD_BLE_TIME,
   FLOYD_DEVICE_NAME_PREFIX,
   chipIdFromDeviceName,
+  decodeScheduleChunk,
   decodeUtf8Json,
   encodeScheduleChunks,
-  encodeUnixSeconds,
+  encodeTimeSync,
+  joinScheduleChunks,
   parseDeviceMessage,
 } from "@/protocol";
 import type {
   CommandEnvelope,
   DeviceMessage,
   Schedule,
+  ScheduleChunk,
 } from "@/protocol";
 import { normalizeTransportError, TransportError } from "./errors";
 import type {
@@ -180,10 +183,12 @@ export class WebBluetoothTransport implements FeederTransport {
     }
   }
 
-  async syncTime(seconds: number): Promise<void> {
+  async syncTime(seconds: number, utcOffsetMinutes?: number): Promise<void> {
     const characteristic = this.requireCharacteristic(FLOYD_BLE_TIME);
     try {
-      await characteristic.writeValueWithResponse(toArrayBuffer(encodeUnixSeconds(seconds)));
+      await characteristic.writeValueWithResponse(
+        toArrayBuffer(encodeTimeSync(seconds, utcOffsetMinutes)),
+      );
     } catch (error) {
       throw normalizeTransportError(error, "connection_failed");
     }
@@ -192,8 +197,7 @@ export class WebBluetoothTransport implements FeederTransport {
   async readSchedules(): Promise<Schedule[]> {
     const characteristic = this.requireCharacteristic(FLOYD_BLE_SCHEDULES);
     try {
-      const value = await characteristic.readValue();
-      const parsed = decodeUtf8Json(value);
+      const parsed = decodeUtf8Json(await readScheduleBytes(characteristic));
       if (!Array.isArray(parsed) || !parsed.every(isScheduleShape)) {
         throw new TransportError(
           "invalid_response",
@@ -325,6 +329,39 @@ export class WebBluetoothTransport implements FeederTransport {
       }
     }
   }
+}
+
+const SCHEDULE_PAGE_LIMIT = 64;
+
+function dataViewBytes(value: DataView): Uint8Array {
+  return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+}
+
+/**
+ * Each READ returns the next page (uint16 LE index, uint16 LE total, JSON bytes) because
+ * a BLE attribute holds at most 512 bytes. Firmware that returns the raw JSON list
+ * (first byte "[") is still accepted.
+ */
+async function readScheduleBytes(characteristic: BluetoothCharacteristicLike): Promise<Uint8Array> {
+  const first = dataViewBytes(await characteristic.readValue());
+  if (first[0] === 0x5b) return first;
+
+  const pages: ScheduleChunk[] = [];
+  let page = decodeScheduleChunk(first);
+  for (let reads = 1; page && reads <= SCHEDULE_PAGE_LIMIT; reads += 1) {
+    if (page.index === pages.length && (pages.length === 0 || page.total === pages[0].total)) {
+      pages.push(page);
+      if (pages.length === page.total) return joinScheduleChunks(pages);
+    } else if (page.index === 0) {
+      pages.splice(0, pages.length, page);
+      if (page.total === 1) return joinScheduleChunks(pages);
+    } else {
+      // Out-of-order page: wait for the firmware cursor to wrap to page 0.
+      pages.length = 0;
+    }
+    page = decodeScheduleChunk(dataViewBytes(await characteristic.readValue()));
+  }
+  throw new TransportError("invalid_response", "The feeder returned an incomplete schedule list.");
 }
 
 function isScheduleShape(value: unknown): value is Schedule {

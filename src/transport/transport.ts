@@ -24,7 +24,7 @@ export interface FeederTransport {
   onMessage(listener: (message: DeviceMessage) => void): () => void;
   onDisconnect(listener: (reason: string | null) => void): () => void;
   sendCommand(payload: CommandEnvelope): Promise<void>;
-  syncTime(seconds: number): Promise<void>;
+  syncTime(seconds: number, utcOffsetMinutes?: number): Promise<void>;
   readSchedules(): Promise<Schedule[]>;
   writeSchedules(schedules: Schedule[]): Promise<void>;
 }

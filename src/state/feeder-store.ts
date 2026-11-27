@@ -5,8 +5,8 @@ import {
   type DeviceMessage,
   type FeedLogEntry,
   type FeederConfig,
+  type MotorDirection,
   type Schedule,
-  type SensorLogEntry,
 } from "@/protocol";
 import { validateScheduleList } from "@/protocol/schedules";
 import {
@@ -22,7 +22,6 @@ import { normalizeTransportError } from "@/transport/errors";
 import { createDefaultTransport } from "@/transport/wifi-boundary";
 import type { FeederTransport, TransportSupport } from "@/transport/transport";
 
-const MAX_SENSOR_LOG_ENTRIES = 50;
 const MAX_FEED_LOG_ENTRIES = 100;
 const DEFAULT_AUTO_REFRESH_INTERVAL = 10_000;
 const DEFAULT_RECONNECT_DELAY = 1_000;
@@ -41,7 +40,6 @@ export interface FeederSnapshot {
   readonly deviceData: DeviceData;
   readonly schedules: Schedule[];
   readonly feedLogs: FeedLogEntry[];
-  readonly sensorLogs: SensorLogEntry[];
   readonly lastCommandError: string | null;
   readonly isAutoRefreshEnabled: boolean;
   readonly autoRefreshInterval: number;
@@ -119,6 +117,15 @@ function asMotorState(value: unknown): DeviceData["motorState"] | undefined {
   return undefined;
 }
 
+function asMotorDirection(value: unknown): MotorDirection | undefined {
+  return value === "forward" || value === "reverse" || value === "brake" ? value : undefined;
+}
+
+function asPwm(value: unknown): number | undefined {
+  const pwm = asFiniteNumber(value);
+  return pwm !== undefined && pwm >= 0 && pwm <= 1023 ? pwm : undefined;
+}
+
 function isSchedule(value: unknown): value is Schedule {
   const record = asRecord(value);
   return (
@@ -154,7 +161,7 @@ export class FeederStore {
   private readonly unsubscribeDisconnect: () => void;
   private readonly onVisibilityChange = (): void => {
     if (this.visibilityTarget?.visibilityState !== "visible" || !this.snapshot.isConnected) return;
-    void this.transport.syncTime(Math.floor(this.now() / 1000));
+    void this.syncTime().catch(() => undefined);
   };
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private elapsedTimer: ReturnType<typeof setInterval> | null = null;
@@ -162,7 +169,6 @@ export class FeederStore {
   private connectionStartedAt = 0;
   private reconnectStartedAt = 0;
   private reconnectCount = 0;
-  private sensorSequence = 0;
   private manualDisconnect = false;
   private destroyed = false;
 
@@ -186,7 +192,6 @@ export class FeederStore {
       deviceData: {},
       schedules: [],
       feedLogs: loadFeedLogs(this.storage),
-      sensorLogs: [],
       lastCommandError: null,
       isAutoRefreshEnabled: true,
       autoRefreshInterval: DEFAULT_AUTO_REFRESH_INTERVAL,
@@ -340,9 +345,6 @@ export class FeederStore {
     saveFeedLogs(this.storage, bounded);
   }
 
-  clearSensorLogs(): void {
-    this.patch({ sensorLogs: [] });
-  }
   clearCommandError(): void {
     this.patch({ lastCommandError: null });
   }
@@ -379,6 +381,11 @@ export class FeederStore {
     }
   }
 
+  private syncTime(): Promise<void> {
+    const now = this.now();
+    return this.transport.syncTime(Math.floor(now / 1000), -new Date(now).getTimezoneOffset());
+  }
+
   private async markConnected(): Promise<void> {
     this.stopElapsedTimer();
     const chipId = this.transport.chipId ?? this.snapshot.chipId;
@@ -397,7 +404,7 @@ export class FeederStore {
     });
     this.reconnectCount = 0;
     this.reconnectStartedAt = 0;
-    await this.transport.syncTime(Math.floor(this.now() / 1000)).catch(() => undefined);
+    await this.syncTime().catch(() => undefined);
     this.startAutoRefresh();
     await this.reloadSchedules();
   }
@@ -405,26 +412,21 @@ export class FeederStore {
   private handleMessage(message: DeviceMessage): void {
     const data = asRecord(message.data);
     if (message.type === "sensor_data" && data) {
-      const nextData: DeviceData = {
-        ...this.snapshot.deviceData,
-        temperature: asFiniteNumber(data.temperature) ?? this.snapshot.deviceData.temperature,
-        distance: asFiniteNumber(data.distance) ?? this.snapshot.deviceData.distance,
-        foodLevelPercentage:
-          asFiniteNumber(data.foodLevelPercentage) ?? this.snapshot.deviceData.foodLevelPercentage,
-        temperatureSensorConnected:
-          asBoolean(data.temperatureSensorConnected) ??
-          this.snapshot.deviceData.temperatureSensorConnected,
-        ultrasonicSensorConnected:
-          asBoolean(data.ultrasonicSensorConnected) ??
-          this.snapshot.deviceData.ultrasonicSensorConnected,
-        motorState: asMotorState(data.motorState) ?? this.snapshot.deviceData.motorState ?? "idle",
-        augerSpeed: asFiniteNumber(data.augerSpeed) ?? this.snapshot.deviceData.augerSpeed,
-        impellerSpeed: asFiniteNumber(data.impellerSpeed) ?? this.snapshot.deviceData.impellerSpeed,
-        lastUpdate: message.timestamp,
-        esp32Connected: true,
-      };
-      this.patch({ deviceData: nextData });
-      this.appendSensorLog(message.timestamp, nextData);
+      const previous = this.snapshot.deviceData;
+      this.patch({
+        deviceData: {
+          ...previous,
+          motorState: asMotorState(data.motorState) ?? previous.motorState ?? "idle",
+          augerSpeed: asPwm(data.augerSpeed) ?? previous.augerSpeed,
+          impellerSpeed: asPwm(data.impellerSpeed) ?? previous.impellerSpeed,
+          augerDirection: asMotorDirection(data.augerDirection) ?? previous.augerDirection,
+          impellerDirection: asMotorDirection(data.impellerDirection) ?? previous.impellerDirection,
+          buttonAPressed: asBoolean(data.buttonAPressed) ?? previous.buttonAPressed,
+          buttonBPressed: asBoolean(data.buttonBPressed) ?? previous.buttonBPressed,
+          lastUpdate: message.timestamp,
+          esp32Connected: true,
+        },
+      });
       return;
     }
 
@@ -467,20 +469,6 @@ export class FeederStore {
       const messageText = data && typeof data.message === "string" ? data.message : "The feeder reported an error.";
       this.setCommandError(messageText);
     }
-  }
-
-  private appendSensorLog(timestamp: number, data: DeviceData): void {
-    this.sensorSequence += 1;
-    const entry: SensorLogEntry = {
-      id: `${this.now()}-${this.sensorSequence}`,
-      timestamp,
-      temperature: data.temperature,
-      distance: data.distance,
-      foodLevel: data.foodLevelPercentage,
-      temperatureSensorConnected: data.temperatureSensorConnected ?? false,
-      ultrasonicSensorConnected: data.ultrasonicSensorConnected ?? false,
-    };
-    this.patch({ sensorLogs: [entry, ...this.snapshot.sensorLogs].slice(0, MAX_SENSOR_LOG_ENTRIES) });
   }
 
   private appendFeedLog(data: Record<string, unknown>): void {

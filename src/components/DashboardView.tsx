@@ -1,12 +1,9 @@
-import { generateAlerts } from "@/protocol";
+import type { MotorDirection } from "@/protocol";
 import { useFeederSnapshot, useFeederStore } from "@/state/feeder-context";
-import { AlertList } from "./AlertList";
 import { MetricCard } from "./MetricCard";
 import { StatusBanner } from "./StatusBanner";
 
-function validValue(value: number | undefined, min: number, max: number): number | null {
-  return value !== undefined && Number.isFinite(value) && value >= min && value <= max ? value : null;
-}
+const PWM_MAX = 1023;
 
 function motorLabel(state: string | undefined): string {
   const labels: Record<string, string> = {
@@ -19,6 +16,16 @@ function motorLabel(state: string | undefined): string {
   return labels[state ?? "idle"] ?? "Idle";
 }
 
+const DIRECTION_LABELS: Record<MotorDirection, string> = {
+  forward: "Forward",
+  reverse: "Reverse",
+  brake: "Brake",
+};
+
+function speedPercent(pwm: number | undefined): string {
+  return pwm === undefined ? "--" : `${Math.round((pwm / PWM_MAX) * 100)}%`;
+}
+
 function formatFeedDate(timestamp: string): string {
   return new Date(timestamp).toLocaleString();
 }
@@ -26,15 +33,16 @@ function formatFeedDate(timestamp: string): string {
 export function DashboardView() {
   const snapshot = useFeederSnapshot();
   const store = useFeederStore();
-  const temperature = snapshot.isConnected
-    ? validValue(snapshot.deviceData.temperature, -40, 85)
-    : null;
-  const foodLevel = snapshot.isConnected
-    ? validValue(snapshot.deviceData.foodLevelPercentage, 0, 100)
-    : null;
-  const distance = snapshot.isConnected ? validValue(snapshot.deviceData.distance, 0, 400) : null;
-  const alerts = generateAlerts(snapshot.deviceData, snapshot.isConnected);
-  const activeMotor = snapshot.deviceData.motorState && snapshot.deviceData.motorState !== "idle";
+  const data = snapshot.isConnected ? snapshot.deviceData : {};
+  const activeMotor = data.motorState !== undefined && data.motorState !== "idle";
+  const motors = [
+    { name: "Auger", detail: "Feed motor", direction: data.augerDirection, speed: data.augerSpeed },
+    { name: "Impeller", detail: "Spread motor", direction: data.impellerDirection, speed: data.impellerSpeed },
+  ];
+  const buttons = [
+    { name: "Button A", role: "feed", pressed: data.buttonAPressed },
+    { name: "Button B", role: "clear jam", pressed: data.buttonBPressed },
+  ];
 
   return (
     <div className="view-stack">
@@ -44,62 +52,45 @@ export function DashboardView() {
         </StatusBanner>
       ) : null}
 
-      <section className="metric-grid" aria-label="Feeder readings">
-        <MetricCard
-          label="Food remaining"
-          value={foodLevel === null ? "--" : foodLevel.toFixed(0)}
-          unit={foodLevel === null ? undefined : "%"}
-          detail={distance === null ? "Level sensor: no data" : `Level distance ${distance.toFixed(1)} cm`}
-          tone={foodLevel !== null && foodLevel <= 10 ? "danger" : "primary"}
-        />
-        <MetricCard
-          label="Water temperature"
-          value={temperature === null ? "--" : temperature.toFixed(1)}
-          unit={temperature === null ? undefined : "°C"}
-          detail={snapshot.deviceData.temperatureSensorConnected === false ? "Temperature sensor disconnected" : "Temperature sensor"}
-          tone={temperature !== null && (temperature < 20 || temperature > 32) ? "warning" : "secondary"}
-        />
+      <section className="metric-grid" aria-label="Feeder status">
         <MetricCard
           label="Motor status"
-          value={motorLabel(snapshot.deviceData.motorState)}
-          detail={activeMotor ? `Auger ${snapshot.deviceData.augerSpeed ?? 0} · spread ${snapshot.deviceData.impellerSpeed ?? 0}` : "Ready for a manual feed"}
+          value={snapshot.isConnected ? motorLabel(data.motorState) : "--"}
+          detail={activeMotor ? "Sequence running" : snapshot.isConnected ? "Ready for a manual feed" : "Connect to see live status"}
           tone={activeMotor ? "primary" : "neutral"}
         />
+        {motors.map((motor) => {
+          const running = motor.direction === "forward" || motor.direction === "reverse";
+          return (
+            <MetricCard
+              key={motor.name}
+              ariaLabel={`${motor.name} motor`}
+              label={motor.name}
+              value={motor.direction ? DIRECTION_LABELS[motor.direction] : "--"}
+              detail={`${motor.detail} · speed ${speedPercent(motor.speed)}`}
+              tone={motor.direction === "reverse" ? "warning" : running ? "primary" : "neutral"}
+            />
+          );
+        })}
       </section>
 
-      <section className="panel capacity-panel" aria-labelledby="capacity-heading">
+      <section className="panel" aria-labelledby="buttons-heading">
         <div className="panel-heading">
           <div>
-            <h2 id="capacity-heading">Feeder capacity</h2>
-            <p className="panel-subtitle">Current reading from the ultrasonic level sensor.</p>
-          </div>
-          <strong>{foodLevel === null ? "--" : `${foodLevel.toFixed(0)}%`}</strong>
-        </div>
-        <div
-          className="progress-track"
-          role="progressbar"
-          aria-label="Food remaining"
-          aria-valuemin={0}
-          aria-valuemax={100}
-          aria-valuenow={foodLevel ?? 0}
-          aria-valuetext={foodLevel === null ? "No reading" : `${foodLevel.toFixed(0)} percent`}
-        >
-          <span className="progress-fill" style={{ width: `${foodLevel ?? 0}%` }} />
-        </div>
-        <p className="field-help">
-          {snapshot.deviceData.ultrasonicSensorConnected === false ? "Food level sensor disconnected." : foodLevel === null ? "Connect to see a live capacity reading." : "Reading is within the feeder sensor range."}
-        </p>
-      </section>
-
-      <section className="panel" aria-labelledby="alerts-heading">
-        <div className="panel-heading">
-          <div>
-            <h2 id="alerts-heading">Alerts{alerts.length > 0 ? ` (${alerts.length})` : ""}</h2>
-            <p className="panel-subtitle">Derived from the latest valid sensor readings.</p>
+            <h2 id="buttons-heading">Feeder buttons</h2>
+            <p className="panel-subtitle">Button A starts or stops a feed. Button B clears a jam.</p>
           </div>
         </div>
-        <AlertList alerts={alerts} limit={3} />
-        {alerts.length > 3 ? <a className="inline-link" href="#logs" >View all alerts</a> : null}
+        <div className="log-list">
+          {buttons.map((button) => (
+            <div className="log-row log-row-heading" role="group" aria-label={`${button.name} (${button.role})`} key={button.name}>
+              <strong>{button.name} · {button.role}</strong>
+              <span className={button.pressed ? "result result--success" : "result"}>
+                {button.pressed === undefined ? "--" : button.pressed ? "Pressed" : "Released"}
+              </span>
+            </div>
+          ))}
+        </div>
       </section>
 
       <section className="panel" aria-labelledby="recent-feed-heading">

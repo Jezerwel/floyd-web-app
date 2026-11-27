@@ -52,15 +52,21 @@ export type MotorState =
   | "post_spin"
   | "jam_clear";
 
+/** H-bridge state from the two enable pins: forward = 1/0, reverse = 0/1, brake = 0/0. */
+export type MotorDirection = "forward" | "reverse" | "brake";
+
 export interface DeviceData {
-  temperature?: number;
-  temperatureSensorConnected?: boolean;
-  ultrasonicSensorConnected?: boolean;
-  distance?: number;
-  foodLevelPercentage?: number;
   motorState?: MotorState;
+  /** PWM duty 0-1023. */
   augerSpeed?: number;
+  /** PWM duty 0-1023. */
   impellerSpeed?: number;
+  augerDirection?: MotorDirection;
+  impellerDirection?: MotorDirection;
+  /** Physical Button A (manual feed). */
+  buttonAPressed?: boolean;
+  /** Physical Button B (clear jam). */
+  buttonBPressed?: boolean;
   wifiRssi?: number;
   feederConfig?: FeederConfig;
   lastUpdate?: number;
@@ -88,32 +94,6 @@ export interface FeedLogEntry {
   feedMs: number;
   success: boolean;
   errorMessage?: string;
-}
-
-export interface SensorLogEntry {
-  id: string;
-  timestamp: number;
-  temperature?: number;
-  distance?: number;
-  foodLevel?: number;
-  temperatureSensorConnected: boolean;
-  ultrasonicSensorConnected: boolean;
-}
-
-export interface Alert {
-  id: string;
-  type:
-    | "LOW_FOOD"
-    | "CRITICAL_FOOD"
-    | "TEMPERATURE_HIGH"
-    | "TEMPERATURE_LOW"
-    | "SENSOR_DISCONNECTED"
-    | "CONNECTION_LOST";
-  message: string;
-  timestamp: string;
-  severity: "HIGH" | "MEDIUM" | "LOW";
-  isResolved: boolean;
-  triggerValue?: number;
 }
 
 export type ConnectionState =

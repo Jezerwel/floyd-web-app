@@ -58,6 +58,19 @@ export function encodeUnixSeconds(seconds: number): Uint8Array {
   return new Uint8Array(buffer);
 }
 
+/**
+ * Time sync payload: uint32 LE Unix seconds, then (optional) int16 LE UTC offset in
+ * minutes east of UTC. The offset lets the feeder run "HH:MM" schedules in local time.
+ */
+export function encodeTimeSync(seconds: number, utcOffsetMinutes?: number): Uint8Array {
+  const unix = encodeUnixSeconds(seconds);
+  if (utcOffsetMinutes === undefined) return unix;
+  const bytes = new Uint8Array(6);
+  bytes.set(unix, 0);
+  new DataView(bytes.buffer).setInt16(4, Math.trunc(utcOffsetMinutes), true);
+  return bytes;
+}
+
 export function decodeUtf8Json(value: DataView | Uint8Array | ArrayBuffer): unknown {
   const bytes =
     value instanceof DataView
