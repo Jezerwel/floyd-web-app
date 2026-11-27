@@ -39,6 +39,7 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <BLESecurity.h>
 #include <Preferences.h>
 #include <sys/time.h>
 #include <time.h>
@@ -209,10 +210,11 @@ void sendJson(BLECharacteristic* characteristic, JsonDocument& doc) {
   if (bleConnected) characteristic->notify();
 }
 
-void sendError(const char* message) {
+void sendError(const char* message, const char* action = nullptr) {
   JsonDocument doc;
   doc["type"] = "error";
   doc["data"]["message"] = message;
+  if (action) doc["data"]["action"] = action;
   sendJson(responseChar, doc);
   Serial.printf("[error] %s\n", message);
 }
@@ -362,6 +364,7 @@ void updateButtons() {
 // ---------------------------------------------------------------- schedules
 Schedule schedules[MAX_SCHEDULES];
 size_t scheduleCount = 0;
+int32_t lastAttemptedScheduleMinute = -1;
 
 bool readSpeed(JsonVariantConst v, uint16_t& out) {
   if (!v.is<float>()) return false;
@@ -412,7 +415,6 @@ bool parseSchedules(const uint8_t* json, size_t length, Schedule* out, size_t& c
     s.minute = minute;
     s.enabled = item["enabled"].as<bool>();
     s.job.source = "schedule";
-    s.lastFiredMinute = -1;
     out[count++] = s;
   }
   return true;
@@ -445,22 +447,23 @@ void loadSchedulesFromFlash() {
 void handleScheduleUpload() {
   if (scheduleRxFailed) {
     scheduleRxFailed = false;
-    sendError("Schedule upload failed: pages arrived out of order or exceeded 4096 bytes.");
+    sendError("Schedule upload failed: pages arrived out of order or exceeded 4096 bytes.", "set_schedules");
   }
   if (!scheduleRxReady) return;
 
   Schedule parsed[MAX_SCHEDULES];
   size_t count = 0;
   const char* error = nullptr;
-  if (parseSchedules(scheduleRx, scheduleRxLen, parsed, count, error)) {
+  if (!parseSchedules(scheduleRx, scheduleRxLen, parsed, count, error)) {
+    sendError(error, "set_schedules");
+  } else if (prefs.putBytes("sched", scheduleRx, scheduleRxLen) != scheduleRxLen) {
+    sendError("The feeder could not save schedules to flash.", "set_schedules");
+  } else {
     memcpy(schedules, parsed, sizeof(Schedule) * count);
     scheduleCount = count;
     storeScheduleJson(scheduleRx, scheduleRxLen);
-    prefs.putBytes("sched", scheduleRx, scheduleRxLen);
     Serial.printf("[schedules] %u saved\n", (unsigned)count);
     sendControlResponse("set_schedules", true);
-  } else {
-    sendError(error);
   }
   scheduleRxReady = false;
 }
@@ -472,13 +475,16 @@ void runSchedules() {
   struct tm t;
   gmtime_r(&local, &t);
   int32_t minuteKey = (int32_t)(local / 60);
+  if (lastAttemptedScheduleMinute == minuteKey) return;
 
   for (size_t i = 0; i < scheduleCount; ++i) {
     Schedule& s = schedules[i];
-    if (!s.enabled || s.lastFiredMinute == minuteKey) continue;
+    if (!s.enabled) continue;
     if (s.hour != t.tm_hour || s.minute != t.tm_min || !(s.daysMask & (1 << t.tm_wday))) continue;
-    s.lastFiredMinute = minuteKey;
+    // The feeder attempts one scheduled feed per minute, including across list edits.
+    lastAttemptedScheduleMinute = minuteKey;
     if (!startFeed(s.job)) Serial.println("[schedules] skipped: feeder busy");
+    break;
   }
 }
 
@@ -609,9 +615,26 @@ class ScheduleCallbacks : public BLECharacteristicCallbacks {
 
 BLECharacteristic* addCharacteristic(BLEService* service, const char* uuid, uint32_t properties) {
   BLECharacteristic* c = service->createCharacteristic(uuid, properties);
+  if (properties & BLECharacteristic::PROPERTY_WRITE) {
+    esp_gatt_perm_t permissions = ESP_GATT_PERM_WRITE_ENC_MITM;
+    if (properties & BLECharacteristic::PROPERTY_READ) permissions |= ESP_GATT_PERM_READ;
+    c->setAccessPermissions(permissions);
+  }
   if (properties & BLECharacteristic::PROPERTY_NOTIFY) c->addDescriptor(new BLE2902());
   return c;
 }
+
+class OwnerPairingCallbacks : public BLESecurityCallbacks {
+  uint32_t onPassKeyRequest() override { return UINT32_MAX; }  // The feeder is display-only.
+  bool onConfirmPIN(uint32_t) override { return false; }
+  bool onSecurityRequest() override { return true; }
+  void onPassKeyNotify(uint32_t passkey) override {
+    Serial.printf("[ble] Enter this pairing code on your phone: %06lu\n", (unsigned long)passkey);
+  }
+  void onAuthenticationComplete(esp_ble_auth_cmpl_t result) override {
+    Serial.println(result.success ? "[ble] Pairing complete" : "[ble] Pairing failed");
+  }
+};
 
 void setupBle() {
   char chipId[7];
@@ -619,6 +642,16 @@ void setupBle() {
   String name = String("FloydFeeder-") + chipId;
 
   BLEDevice::init(name.c_str());
+  BLEDevice::setSecurityCallbacks(new OwnerPairingCallbacks());
+  static BLESecurity security;
+  security.setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
+  security.setCapability(ESP_IO_CAP_OUT);
+  security.setKeySize(16);
+  security.setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+  security.setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+  uint8_t requireSecurePairing = ESP_BLE_ONLY_ACCEPT_SPECIFIED_AUTH_ENABLE;
+  ESP_ERROR_CHECK(esp_ble_gap_set_security_param(
+    ESP_BLE_SM_ONLY_ACCEPT_SPECIFIED_SEC_AUTH, &requireSecurePairing, sizeof(requireSecurePairing)));
   BLEDevice::setMTU(517);
   bleServer = BLEDevice::createServer();
   bleServer->setCallbacks(new ServerCallbacks());

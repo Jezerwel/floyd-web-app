@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useRef, useState, type FormEvent } from "react";
 import {
   daysStringToFlags,
   flagsToDaysString,
@@ -7,6 +7,7 @@ import {
   type Schedule,
 } from "@/protocol";
 import { useFeederSnapshot, useFeederStore } from "@/state/feeder-context";
+import type { FeederSnapshot } from "@/state/feeder-store";
 import { StatusBanner } from "./StatusBanner";
 
 const DAY_LABELS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"] as const;
@@ -27,23 +28,28 @@ const emptyForm: ScheduleForm = {
 
 export function ScheduleView() {
   const snapshot = useFeederSnapshot();
+  return <ScheduleEditor key={snapshot.isConnected ? snapshot.chipId : "disconnected"} snapshot={snapshot} />;
+}
+
+function ScheduleEditor({ snapshot }: { snapshot: FeederSnapshot }) {
   const store = useFeederStore();
-  const [dialogOpen, setDialogOpen] = useState(false);
-  const [editingId, setEditingId] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const [draft, setDraft] = useState<{ id: string; isNew: boolean } | null>(null);
   const [form, setForm] = useState<ScheduleForm>(emptyForm);
   const [errors, setErrors] = useState<string[]>([]);
-  const [saving, setSaving] = useState(false);
   const [deleteId, setDeleteId] = useState<string | null>(null);
+  const saving = snapshot.scheduleState === "saving";
+  const loading = snapshot.scheduleState === "loading" || snapshot.scheduleState === "unloaded";
+  const canEdit = snapshot.isConnected && snapshot.scheduleState === "ready" && !snapshot.clockSyncPending;
 
   function openAdd(): void {
-    setEditingId(null);
+    setDraft({ id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`, isNew: true });
     setForm(emptyForm);
     setErrors([]);
-    setDialogOpen(true);
   }
 
   function openEdit(schedule: Schedule): void {
-    setEditingId(schedule.id);
+    setDraft({ id: schedule.id, isNew: false });
     setForm({
       label: schedule.label,
       time: schedule.time,
@@ -51,12 +57,12 @@ export function ScheduleView() {
       enabled: schedule.enabled,
     });
     setErrors([]);
-    setDialogOpen(true);
   }
 
   function closeDialog(): void {
     if (saving) return;
-    setDialogOpen(false);
+    dialogRef.current?.close?.();
+    setDraft(null);
     setErrors([]);
   }
 
@@ -68,9 +74,14 @@ export function ScheduleView() {
 
   async function saveSchedule(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
-    const existing = editingId ? snapshot.schedules.find((item) => item.id === editingId) : undefined;
+    if (!canEdit || !draft) return;
+    const existing = snapshot.schedules.find((item) => item.id === draft.id);
+    if (!draft.isNew && !existing) {
+      setErrors(["This schedule was removed. Close the editor and reload the list."]);
+      return;
+    }
     const schedule: Schedule = {
-      id: editingId ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`,
+      id: draft.id,
       label: form.label.trim(),
       time: form.time,
       daysOfWeek: form.daysOfWeek,
@@ -87,12 +98,10 @@ export function ScheduleView() {
       return;
     }
 
-    setSaving(true);
-    const updated = editingId
-      ? snapshot.schedules.map((item) => (item.id === editingId ? schedule : item))
+    const updated = existing
+      ? snapshot.schedules.map((item) => (item.id === draft.id ? schedule : item))
       : [...snapshot.schedules, schedule];
     const ok = await store.publishScheduleSync(updated);
-    setSaving(false);
     if (ok) closeDialog();
   }
 
@@ -105,23 +114,53 @@ export function ScheduleView() {
   }
 
   async function deleteSchedule(schedule: Schedule): Promise<void> {
-    setDeleteId(null);
-    await store.publishScheduleSync(snapshot.schedules.filter((item) => item.id !== schedule.id));
+    const ok = await store.publishScheduleSync(snapshot.schedules.filter((item) => item.id !== schedule.id));
+    if (ok) setDeleteId(null);
   }
 
   return (
     <div className="view-stack">
-      {snapshot.lastCommandError ? <StatusBanner tone="error">{snapshot.lastCommandError}</StatusBanner> : null}
+      {snapshot.isConnected && !snapshot.clockSynced ? (
+        <StatusBanner tone="warning">
+          {snapshot.clockSyncPending
+            ? "Syncing the feeder clock…"
+            : "The feeder clock is not confirmed. Scheduled feeds may not run."}
+          {snapshot.clockError ? <p>{snapshot.clockError}</p> : null}
+          <button
+            type="button"
+            className="button button--quiet"
+            disabled={loading || saving || snapshot.clockSyncPending}
+            onClick={() => void store.syncClock()}
+          >
+            Retry clock sync
+          </button>
+        </StatusBanner>
+      ) : null}
+      {snapshot.scheduleError && !draft ? (
+        <StatusBanner tone="error">
+          {snapshot.scheduleError}
+          {snapshot.scheduleState === "error" ? (
+            <button type="button" className="button button--quiet" disabled={snapshot.clockSyncPending} onClick={() => void store.reloadSchedules()}>
+              Reload schedules
+            </button>
+          ) : null}
+        </StatusBanner>
+      ) : null}
       <section className="panel" aria-labelledby="schedule-list-heading">
         <div className="panel-heading">
           <div>
             <h2 id="schedule-list-heading">Feeding schedule</h2>
             <p className="panel-subtitle">Up to 10 schedules are stored on the feeder.</p>
           </div>
-          <button type="button" className="button button--primary" onClick={openAdd}>Add schedule</button>
+          <button type="button" className="button button--primary" onClick={openAdd} disabled={!canEdit}>Add schedule</button>
         </div>
 
-        {snapshot.schedules.length === 0 ? (
+        {saving ? <p role="status">Saving schedules…</p> : null}
+        {!snapshot.isConnected ? (
+          <p>Connect to a feeder to view its schedules.</p>
+        ) : loading ? (
+          <p role="status">Loading schedules…</p>
+        ) : snapshot.scheduleState === "error" && snapshot.schedules.length === 0 ? null : snapshot.schedules.length === 0 ? (
           <div className="empty-state">
             <strong>No schedules</strong>
             <span>Add a time and at least one weekday to begin.</span>
@@ -150,20 +189,21 @@ export function ScheduleView() {
                       <input
                         type="checkbox"
                         checked={schedule.enabled}
+                        disabled={!canEdit}
                         onChange={() => void toggleEnabled(schedule)}
                       />
                       <span>Enabled</span>
                     </label>
-                    <button type="button" className="button button--quiet" onClick={() => openEdit(schedule)} aria-label={`Edit ${schedule.label}`}>
+                    <button type="button" className="button button--quiet" onClick={() => openEdit(schedule)} aria-label={`Edit ${schedule.label}`} disabled={!canEdit}>
                       Edit
                     </button>
                     {deleteId === schedule.id ? (
                       <>
-                        <button type="button" className="button button--danger" onClick={() => void deleteSchedule(schedule)}>Confirm delete</button>
+                        <button type="button" className="button button--danger" onClick={() => void deleteSchedule(schedule)} disabled={!canEdit}>Confirm delete</button>
                         <button type="button" className="button button--quiet" onClick={() => setDeleteId(null)}>Cancel</button>
                       </>
                     ) : (
-                      <button type="button" className="button button--quiet button--danger-text" onClick={() => setDeleteId(schedule.id)} aria-label={`Delete ${schedule.label}`}>
+                      <button type="button" className="button button--quiet button--danger-text" onClick={() => setDeleteId(schedule.id)} aria-label={`Delete ${schedule.label}`} disabled={!canEdit}>
                         Delete
                       </button>
                     )}
@@ -175,16 +215,36 @@ export function ScheduleView() {
         )}
       </section>
 
-      {dialogOpen ? (
-        <dialog className="modal" open aria-labelledby="schedule-dialog-title" onCancel={(event) => { event.preventDefault(); closeDialog(); }}>
+      {draft ? (
+        <dialog
+          className="modal"
+          ref={(dialog) => {
+            dialogRef.current = dialog;
+            if (!dialog || dialog.open) return;
+            if (dialog.showModal) dialog.showModal();
+            else dialog.setAttribute("open", "");
+          }}
+          aria-labelledby="schedule-dialog-title"
+          onCancel={(event) => { event.preventDefault(); closeDialog(); }}
+        >
           <form className="modal-form" onSubmit={(event) => void saveSchedule(event)}>
             <div className="modal-heading">
               <div>
-                <h2 id="schedule-dialog-title">{editingId ? "Edit schedule" : "New schedule"}</h2>
+                <h2 id="schedule-dialog-title">{draft.isNew ? "New schedule" : "Edit schedule"}</h2>
                 <p className="panel-subtitle">The feeder will receive the complete schedule list.</p>
               </div>
-              <button type="button" className="icon-button" onClick={closeDialog} aria-label="Close schedule dialog">×</button>
+              <button type="button" className="icon-button" onClick={closeDialog} aria-label="Close schedule dialog" disabled={saving}>×</button>
             </div>
+            {snapshot.scheduleError ? (
+              <StatusBanner tone="error">
+                {snapshot.scheduleError}
+                {snapshot.scheduleState === "error" ? (
+                  <button type="button" className="button button--quiet" disabled={snapshot.clockSyncPending} onClick={() => void store.reloadSchedules()}>
+                    Reload schedules
+                  </button>
+                ) : null}
+              </StatusBanner>
+            ) : null}
             {errors.length > 0 ? (
               <div className="form-errors" role="alert" id="schedule-errors">
                 {errors.map((error) => <p key={error}>{error}</p>)}
@@ -197,6 +257,7 @@ export function ScheduleView() {
                 name="label"
                 type="text"
                 autoFocus
+                disabled={saving}
                 value={form.label}
                 onChange={(event) => setForm((current) => ({ ...current, label: event.target.value }))}
                 aria-invalid={errors.some((error) => error === "Label is required.")}
@@ -209,13 +270,14 @@ export function ScheduleView() {
                 id="schedule-time"
                 name="time"
                 type="time"
+                disabled={saving}
                 value={form.time}
                 onChange={(event) => setForm((current) => ({ ...current, time: event.target.value }))}
                 aria-invalid={errors.some((error) => error.startsWith("Time must"))}
                 aria-describedby={errors.length > 0 ? "schedule-errors" : undefined}
               />
             </label>
-            <fieldset className="field weekday-fieldset">
+            <fieldset className="field weekday-fieldset" disabled={saving}>
               <legend>Days of the week</legend>
               <div className="day-checkboxes">
                 {DAY_LABELS.map((day, index) => (
@@ -231,12 +293,12 @@ export function ScheduleView() {
               </div>
             </fieldset>
             <label className="switch-label switch-label--form">
-              <input type="checkbox" checked={form.enabled} onChange={(event) => setForm((current) => ({ ...current, enabled: event.target.checked }))} />
+              <input type="checkbox" checked={form.enabled} disabled={saving} onChange={(event) => setForm((current) => ({ ...current, enabled: event.target.checked }))} />
               <span>Enabled</span>
             </label>
             <div className="modal-actions">
-              <button type="button" className="button button--quiet" onClick={closeDialog}>Cancel</button>
-              <button type="submit" className="button button--primary" disabled={saving}>{saving ? "Saving…" : "Save schedule"}</button>
+              <button type="button" className="button button--quiet" onClick={closeDialog} disabled={saving}>Cancel</button>
+              <button type="submit" className="button button--primary" disabled={!canEdit}>{saving ? "Saving…" : "Save schedule"}</button>
             </div>
           </form>
         </dialog>

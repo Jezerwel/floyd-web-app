@@ -42,7 +42,14 @@ export function AppShell({ children }: PropsWithChildren) {
 
   return (
     <div className="app-shell">
-      <a className="skip-link" href="#main-content">
+      <a
+        className="skip-link"
+        href="#main-content"
+        onClick={(event) => {
+          event.preventDefault();
+          document.getElementById("main-content")?.focus();
+        }}
+      >
         Skip to content
       </a>
       <aside className="sidebar" aria-label="Primary navigation">
@@ -78,9 +85,9 @@ export function AppShell({ children }: PropsWithChildren) {
           </div>
           {snapshot.chipId ? <span className="chip-id">{snapshot.chipId}</span> : null}
         </header>
-        <main id="main-content" className="main-content" tabIndex={-1}>
+        <main className="main-content">
           <div className="page-heading">
-            <h1>{meta.label}</h1>
+            <h1 id="main-content" tabIndex={-1}>{meta.label}</h1>
             <p>{meta.description}</p>
           </div>
           <ConnectionPanel />

@@ -1,6 +1,8 @@
+import { Capacitor } from "@capacitor/core";
 import type { WebBluetoothTransportOptions } from "./web-bluetooth";
 import { WebBluetoothTransport } from "./web-bluetooth";
 import type { FeederTransport } from "./transport";
+import { nativeBluetooth } from "./native-bluetooth";
 
 export interface WifiAvailability {
   available: false;
@@ -17,5 +19,8 @@ export function getWifiAvailability(): WifiAvailability {
 export function createDefaultTransport(
   options: WebBluetoothTransportOptions = {},
 ): FeederTransport {
+  if (Capacitor.getPlatform() === "ios" && Capacitor.isNativePlatform()) {
+    return new WebBluetoothTransport({ bluetooth: nativeBluetooth, secureContext: true, ...options });
+  }
   return new WebBluetoothTransport(options);
 }

@@ -86,12 +86,11 @@ input:disabled {
   border-radius: 0.55rem;
   color: #ffffff;
   background: var(--primary-dark);
-  transform: translateY(-150%);
-  transition: transform 120ms ease-out;
 }
 
-.skip-link:focus {
-  transform: translateY(0);
+.skip-link:not(:focus) {
+  clip-path: inset(50%);
+  pointer-events: none;
 }
 
 .sidebar {
@@ -929,7 +928,7 @@ input:disabled {
 
 .modal {
   width: min(92vw, 34rem);
-  max-height: 90vh;
+  max-height: min(90dvh, calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 2rem));
   padding: 0;
   border: 1px solid var(--line-strong);
   border-radius: 0.95rem;
@@ -1002,7 +1001,7 @@ input:disabled {
     width: 100%;
     height: auto;
     min-height: 4.4rem;
-    padding: 0.35rem 0.5rem calc(0.35rem + env(safe-area-inset-bottom));
+    padding: 0.35rem max(0.5rem, env(safe-area-inset-right)) calc(0.35rem + env(safe-area-inset-bottom)) max(0.5rem, env(safe-area-inset-left));
     border-top: 1px solid var(--line);
     border-right: 0;
   }
@@ -1034,16 +1033,18 @@ input:disabled {
   }
 
   .shell-content {
-    padding-bottom: 4.9rem;
+    padding-bottom: calc(4.9rem + env(safe-area-inset-bottom));
   }
 
   .topbar {
-    min-height: 3.8rem;
-    padding-inline: 1rem;
+    min-height: calc(3.8rem + env(safe-area-inset-top));
+    padding-top: env(safe-area-inset-top);
+    padding-inline: max(1rem, env(safe-area-inset-left)) max(1rem, env(safe-area-inset-right));
   }
 
   .main-content {
     padding: 1.4rem 1rem 2rem;
+    padding-inline: max(1rem, env(safe-area-inset-left)) max(1rem, env(safe-area-inset-right));
   }
 
   .metric-grid,
@@ -1057,6 +1058,14 @@ input:disabled {
 
   .field--range {
     grid-column: auto;
+  }
+}
+
+@media (pointer: coarse) {
+  .field input[type="text"],
+  .field input[type="time"],
+  .field input[type="number"] {
+    font-size: max(1rem, 16px);
   }
 }
 

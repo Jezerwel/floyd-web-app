@@ -56,6 +56,7 @@ export interface BluetoothServiceLike {
 export interface BluetoothRemoteGATTServerLike {
   readonly connected: boolean;
   connect?: () => Promise<BluetoothRemoteGATTServerLike>;
+  disconnect?: () => void | Promise<void>;
   getPrimaryService(uuid: string): Promise<BluetoothServiceLike>;
 }
 

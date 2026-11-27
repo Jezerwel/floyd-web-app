@@ -8,7 +8,7 @@ import {
   type MotorDirection,
   type Schedule,
 } from "@/protocol";
-import { validateScheduleList } from "@/protocol/schedules";
+import { isScheduleShape, validateScheduleList } from "@/protocol/schedules";
 import {
   getBrowserStorage,
   loadChipId,
@@ -39,6 +39,11 @@ export interface FeederSnapshot {
   readonly deviceName: string | null;
   readonly deviceData: DeviceData;
   readonly schedules: Schedule[];
+  readonly scheduleState: "unloaded" | "loading" | "ready" | "saving" | "error";
+  readonly scheduleError: string | null;
+  readonly clockSynced: boolean;
+  readonly clockSyncPending: boolean;
+  readonly clockError: string | null;
   readonly feedLogs: FeedLogEntry[];
   readonly lastCommandError: string | null;
   readonly isAutoRefreshEnabled: boolean;
@@ -126,23 +131,6 @@ function asPwm(value: unknown): number | undefined {
   return pwm !== undefined && pwm >= 0 && pwm <= 1023 ? pwm : undefined;
 }
 
-function isSchedule(value: unknown): value is Schedule {
-  const record = asRecord(value);
-  return (
-    record !== null &&
-    typeof record.id === "string" &&
-    typeof record.label === "string" &&
-    typeof record.time === "string" &&
-    typeof record.daysOfWeek === "string" &&
-    typeof record.augerSpeed === "number" &&
-    typeof record.impellerSpeed === "number" &&
-    typeof record.preSpinMs === "number" &&
-    typeof record.feedMs === "number" &&
-    typeof record.postSpinMs === "number" &&
-    typeof record.enabled === "boolean"
-  );
-}
-
 function toErrorMessage(error: unknown): string {
   return normalizeTransportError(error).message;
 }
@@ -161,7 +149,7 @@ export class FeederStore {
   private readonly unsubscribeDisconnect: () => void;
   private readonly onVisibilityChange = (): void => {
     if (this.visibilityTarget?.visibilityState !== "visible" || !this.snapshot.isConnected) return;
-    void this.syncTime().catch(() => undefined);
+    void this.syncClock();
   };
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private elapsedTimer: ReturnType<typeof setInterval> | null = null;
@@ -171,6 +159,7 @@ export class FeederStore {
   private reconnectCount = 0;
   private manualDisconnect = false;
   private destroyed = false;
+  private connectionGeneration = 0;
 
   constructor(options: FeederStoreOptions = {}) {
     this.transport = options.transport ?? createDefaultTransport();
@@ -191,6 +180,11 @@ export class FeederStore {
       deviceName: null,
       deviceData: {},
       schedules: [],
+      scheduleState: "unloaded",
+      scheduleError: null,
+      clockSynced: false,
+      clockSyncPending: false,
+      clockError: null,
       feedLogs: loadFeedLogs(this.storage),
       lastCommandError: null,
       isAutoRefreshEnabled: true,
@@ -212,6 +206,7 @@ export class FeederStore {
   getSnapshot = (): FeederSnapshot => this.snapshot;
 
   async startConnection(): Promise<boolean> {
+    const generation = this.resetFeederSession();
     this.cancelReconnect();
     this.manualDisconnect = false;
     this.reconnectCount = 0;
@@ -227,9 +222,11 @@ export class FeederStore {
     this.setConnectionState("scanning");
     try {
       await this.transport.connect({ requestDevice: true, chipId: this.snapshot.chipId });
-      await this.markConnected();
-      return true;
+      if (generation !== this.connectionGeneration) return false;
+      await this.markConnected(generation);
+      return generation === this.connectionGeneration;
     } catch (error) {
+      if (generation !== this.connectionGeneration) return false;
       const normalized = normalizeTransportError(error);
       this.enterConnectionError(normalized.code, normalized.message);
       return false;
@@ -248,6 +245,7 @@ export class FeederStore {
   }
 
   disconnectBle(): void {
+    this.resetFeederSession();
     this.manualDisconnect = true;
     this.cancelReconnect();
     this.stopElapsedTimer();
@@ -293,36 +291,47 @@ export class FeederStore {
   }
 
   async reloadSchedules(): Promise<boolean> {
-    if (!this.snapshot.isConnected) {
-      this.setCommandError("Not connected to feeder.");
+    if (!this.snapshot.isConnected || this.snapshot.scheduleState === "loading" ||
+      this.snapshot.scheduleState === "saving" || this.snapshot.clockSyncPending) {
       return false;
     }
+    const generation = this.connectionGeneration;
+    this.patch({ scheduleState: "loading" });
     try {
       const schedules = await this.transport.readSchedules();
-      this.patch({ schedules, lastCommandError: null });
+      if (generation !== this.connectionGeneration) return false;
+      this.patch({ schedules, scheduleState: "ready", scheduleError: null });
       return true;
     } catch (error) {
-      this.setCommandError(toErrorMessage(error));
+      if (generation === this.connectionGeneration) {
+        this.patch({ scheduleState: "error", scheduleError: toErrorMessage(error) });
+      }
       return false;
     }
   }
 
   async publishScheduleSync(schedules: Schedule[]): Promise<boolean> {
+    if (!this.snapshot.isConnected || this.snapshot.scheduleState !== "ready" ||
+      this.snapshot.clockSyncPending) return false;
     const validationErrors = validateScheduleList(schedules);
     if (validationErrors.length > 0) {
-      this.setCommandError(validationErrors.join(" "));
+      this.patch({ scheduleError: validationErrors.join(" ") });
       return false;
     }
-    if (!this.snapshot.isConnected) {
-      this.setCommandError("Not connected to feeder.");
-      return false;
-    }
+    const generation = this.connectionGeneration;
+    this.patch({ scheduleState: "saving", scheduleError: null });
     try {
       await this.transport.writeSchedules(schedules);
-      this.patch({ schedules: [...schedules], lastCommandError: null });
+      if (generation !== this.connectionGeneration) return false;
+      this.patch({ schedules: [...schedules], scheduleState: "ready" });
       return true;
     } catch (error) {
-      this.setCommandError(toErrorMessage(error));
+      if (generation === this.connectionGeneration) {
+        this.patch({
+          scheduleState: error instanceof RangeError ? "ready" : "error",
+          scheduleError: toErrorMessage(error),
+        });
+      }
       return false;
     }
   }
@@ -352,6 +361,7 @@ export class FeederStore {
   dispose(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.connectionGeneration += 1;
     this.unsubscribeMessage();
     this.unsubscribeDisconnect();
     this.visibilityTarget?.removeEventListener("visibilitychange", this.onVisibilityChange);
@@ -381,12 +391,37 @@ export class FeederStore {
     }
   }
 
-  private syncTime(): Promise<void> {
+  async syncClock(): Promise<void> {
+    if (!this.snapshot.isConnected || this.snapshot.clockSyncPending ||
+      this.snapshot.scheduleState === "loading" || this.snapshot.scheduleState === "saving") return;
+    const generation = this.connectionGeneration;
+    this.patch({ clockSyncPending: true, clockError: null });
     const now = this.now();
-    return this.transport.syncTime(Math.floor(now / 1000), -new Date(now).getTimezoneOffset());
+    try {
+      await this.transport.syncTime(Math.floor(now / 1000), -new Date(now).getTimezoneOffset());
+    } catch (error) {
+      if (generation === this.connectionGeneration) {
+        this.patch({ clockError: toErrorMessage(error) });
+      }
+    } finally {
+      if (generation === this.connectionGeneration) this.patch({ clockSyncPending: false });
+    }
   }
 
-  private async markConnected(): Promise<void> {
+  private resetFeederSession(): number {
+    const generation = ++this.connectionGeneration;
+    this.patch({
+      schedules: [],
+      scheduleState: "unloaded",
+      scheduleError: null,
+      clockSynced: false,
+      clockSyncPending: false,
+      clockError: null,
+    });
+    return generation;
+  }
+
+  private async markConnected(generation: number): Promise<void> {
     this.stopElapsedTimer();
     const chipId = this.transport.chipId ?? this.snapshot.chipId;
     if (chipId) saveChipId(this.storage, chipId);
@@ -404,7 +439,8 @@ export class FeederStore {
     });
     this.reconnectCount = 0;
     this.reconnectStartedAt = 0;
-    await this.syncTime().catch(() => undefined);
+    await this.syncClock();
+    if (generation !== this.connectionGeneration) return;
     this.startAutoRefresh();
     await this.reloadSchedules();
   }
@@ -444,6 +480,7 @@ export class FeederStore {
 
     if (message.type === "status" && data) {
       this.patch({
+        clockSynced: asBoolean(data.timeSynced) ?? this.snapshot.clockSynced,
         deviceData: {
           ...this.snapshot.deviceData,
           feederConfig: isFeederConfig(data.feederConfig)
@@ -457,15 +494,16 @@ export class FeederStore {
       return;
     }
 
-    if (message.type === "schedules_list" && Array.isArray(message.data)) {
+    if (message.type === "schedules_list" && this.snapshot.scheduleState === "ready" &&
+      Array.isArray(message.data) && message.data.every(isScheduleShape)) {
       this.patch({
-        schedules: message.data.filter(isSchedule),
+        schedules: message.data,
         deviceData: { ...this.snapshot.deviceData, lastUpdate: message.timestamp },
       });
       return;
     }
 
-    if (message.type === "error") {
+    if (message.type === "error" && data?.action !== "set_schedules") {
       const messageText = data && typeof data.message === "string" ? data.message : "The feeder reported an error.";
       this.setCommandError(messageText);
     }
@@ -489,6 +527,7 @@ export class FeederStore {
   private handleDisconnect(_reason: string | null): void {
     void _reason;
     if (this.manualDisconnect || this.snapshot.connectionState === "idle") return;
+    this.resetFeederSession();
     this.stopElapsedTimer();
     this.stopAutoRefresh();
     this.reconnectStartedAt ||= this.now();
@@ -525,11 +564,14 @@ export class FeederStore {
     }
 
     this.reconnectCount += 1;
+    const generation = this.connectionGeneration;
     this.setConnectionState("connecting");
     try {
       await this.transport.connect({ requestDevice: false, chipId: this.snapshot.chipId });
-      await this.markConnected();
+      if (generation !== this.connectionGeneration) return;
+      await this.markConnected(generation);
     } catch {
+      if (generation !== this.connectionGeneration) return;
       if (
         this.reconnectCount >= this.reconnectAttempts ||
         this.now() - this.reconnectStartedAt >= this.reconnectWindowMs
@@ -593,7 +635,10 @@ export class FeederStore {
     this.stopAutoRefresh();
     if (!this.snapshot.isConnected || !this.snapshot.isAutoRefreshEnabled) return;
     this.autoRefreshTimer = setInterval(() => {
-      if (this.snapshot.isConnected) void this.requestSensorData();
+      if (this.snapshot.isConnected && !this.snapshot.clockSyncPending &&
+        this.snapshot.scheduleState !== "loading" && this.snapshot.scheduleState !== "saving") {
+        void this.requestSensorData();
+      }
     }, this.snapshot.autoRefreshInterval);
   }
 

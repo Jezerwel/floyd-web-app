@@ -1,12 +1,16 @@
 /* global caches, clients, fetch, location, Response, self, URL */
 
-const CACHE_NAME = "floyd-feeder-shell-v1";
+const BUILD_VERSION = "dev";
+const BUILD_ASSETS = [];
+const CACHE_PREFIX = "floyd-feeder-shell-";
+const CACHE_NAME = CACHE_PREFIX + BUILD_VERSION;
 const APP_SHELL = [
   "/",
   "/index.html",
   "/manifest.webmanifest",
   "/icon-192.svg",
   "/icon-512.svg",
+  ...BUILD_ASSETS,
 ];
 
 self.addEventListener("install", (event) => {
@@ -20,20 +24,12 @@ self.addEventListener("install", (event) => {
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches.keys()
-      .then((keys) => Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))))
+      .then((keys) => Promise.all(
+        keys.filter((key) => key.startsWith(CACHE_PREFIX) && key !== CACHE_NAME).map((key) => caches.delete(key)),
+      ))
       .then(() => clients.claim()),
   );
 });
-
-function isCacheableStatic(url) {
-  return url.pathname === "/"
-    || url.pathname === "/index.html"
-    || url.pathname === "/manifest.webmanifest"
-    || url.pathname === "/icon-192.svg"
-    || url.pathname === "/icon-512.svg"
-    || url.pathname === "/sw.js"
-    || url.pathname.startsWith("/assets/");
-}
 
 self.addEventListener("fetch", (event) => {
   const request = event.request;
@@ -44,27 +40,19 @@ self.addEventListener("fetch", (event) => {
   if (request.mode === "navigate") {
     event.respondWith(
       fetch(request)
-        .then((response) => {
-          if (response.ok) {
-            void caches.open(CACHE_NAME).then((cache) => cache.put("/index.html", response.clone()));
-          }
-          return response;
-        })
-        .catch(() => caches.match("/index.html").then((cached) => cached ?? Response.error())),
+        .catch(() => caches.open(CACHE_NAME)
+          .then((cache) => cache.match("/index.html"))
+          .then((cached) => cached ?? Response.error())),
     );
     return;
   }
 
-  if (!isCacheableStatic(requestUrl)) return;
+  if (!APP_SHELL.includes(requestUrl.pathname)) return;
 
   event.respondWith(
-    fetch(request)
-      .then((response) => {
-        if (response.ok) {
-          void caches.open(CACHE_NAME).then((cache) => cache.put(request, response.clone()));
-        }
-        return response;
-      })
-      .catch(() => caches.match(request).then((cached) => cached ?? Response.error())),
+    caches.open(CACHE_NAME)
+      // Use the precache key so module requests still match responses that vary by Origin.
+      .then((cache) => cache.match(requestUrl.pathname))
+      .then((cached) => cached ?? fetch(request)),
   );
 });

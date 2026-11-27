@@ -266,7 +266,13 @@ describe("WebBluetoothTransport", () => {
     const fixture = makeFixture(initial);
     await fixture.transport.connect();
     expect(await fixture.transport.readSchedules()).toEqual([]);
-    await fixture.transport.writeSchedules([schedule]);
+    fixture.service.characteristic(FLOYD_BLE_SCHEDULES).readQueue = [encodeJson([schedule])];
+    const saved = fixture.transport.writeSchedules([schedule]);
+    fixture.service.characteristic(FLOYD_BLE_RESPONSE).emitJson({
+      type: "control_response",
+      data: { action: "set_schedules", success: true },
+    });
+    await saved;
     const writes = fixture.service.characteristic(FLOYD_BLE_SCHEDULES).writes;
     expect(writes.length).toBeGreaterThan(0);
     expect(new DataView(writes[0].buffer).getUint16(0, true)).toBe(0);

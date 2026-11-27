@@ -1,10 +1,11 @@
+import { Capacitor } from "@capacitor/core";
 import { useFeederSnapshot, useFeederStore } from "@/state/feeder-context";
 import { getWifiAvailability } from "@/transport/wifi-boundary";
 import { StatusBanner } from "./StatusBanner";
 
-function connectionLabel(state: string): string {
+function connectionLabel(state: string, isNative: boolean): string {
   if (state === "connected") return "Connected";
-  if (state === "scanning") return "Waiting for browser device chooser";
+  if (state === "scanning") return isNative ? "Looking for feeders" : "Waiting for browser device chooser";
   if (state === "connecting") return "Connecting to feeder";
   if (state === "error") return "Connection needs attention";
   return "Not connected";
@@ -14,6 +15,7 @@ export function ConnectionPanel() {
   const snapshot = useFeederSnapshot();
   const store = useFeederStore();
   const wifi = getWifiAvailability();
+  const isNative = Capacitor.isNativePlatform();
   const busy = snapshot.connectionState === "scanning" || snapshot.connectionState === "connecting";
   const unavailable = !snapshot.transportSupport.available;
 
@@ -22,7 +24,7 @@ export function ConnectionPanel() {
       <div className="panel-heading">
         <div>
           <h2 id="connection-heading">Feeder connection</h2>
-          <p className="panel-subtitle">{connectionLabel(snapshot.connectionState)}</p>
+          <p className="panel-subtitle">{connectionLabel(snapshot.connectionState, isNative)}</p>
         </div>
         <span
           className={`status-badge status-badge--${snapshot.isConnected ? "online" : "offline"}`}
@@ -65,23 +67,25 @@ export function ConnectionPanel() {
           </button>
         )}
         {snapshot.chipId ? (
-          <button type="button" className="button button--quiet" onClick={() => store.forgetFeeder()}>
+          <button type="button" className="button button--quiet" onClick={() => store.forgetFeeder()} disabled={busy}>
             Forget feeder
           </button>
         ) : null}
       </div>
 
-      <p className="connection-note">
-        Browser Bluetooth uses a device chooser instead of a native scan list. Signal distance is unavailable in the browser.
-      </p>
-
-      <div className="boundary-note">
-        <h3>Provisioning</h3>
-        <p>
-          {wifi.reason} This panel is informational until the firmware adds a browser-safe provisioning path.
+      {!snapshot.isConnected || snapshot.clockSyncPending ? (
+        <p className="connection-note">
+          If your device asks for a pairing code, open the feeder’s USB serial monitor at 115200 baud.
         </p>
-        <p className="muted-copy">Wi‑Fi credentials are not collected or saved by this app.</p>
-      </div>
+      ) : null}
+
+      {!snapshot.isConnected ? (
+        <div className="boundary-note">
+          <h3>Provisioning</h3>
+          <p>{wifi.reason}</p>
+          <p className="muted-copy">Wi‑Fi credentials are not collected or saved by this app.</p>
+        </div>
+      ) : null}
     </section>
   );
 }

@@ -36,7 +36,6 @@ struct Schedule {
   uint8_t daysMask;  // bit 0 = Sunday ... bit 6 = Saturday
   bool enabled;
   FeedJob job;
-  int32_t lastFiredMinute;
 };
 
 struct CommandBuffer {

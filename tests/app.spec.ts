@@ -28,6 +28,10 @@ test("loads the dashboard and navigates the accessible shell", async ({ page }) 
   await page.keyboard.press("Enter");
   await expect(page).toHaveURL(/#logs$/);
   await expect(page.getByRole("heading", { name: "Logs" })).toBeVisible();
+  await page.getByRole("link", { name: "Skip to content" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(/#logs$/);
+  await expect(page.getByRole("heading", { name: "Logs" })).toBeFocused();
 });
 
 test("serves install metadata and an offline shell", async ({ page, request }) => {
@@ -46,7 +50,7 @@ test("serves install metadata and an offline shell", async ({ page, request }) =
   await page.evaluate(async () => {
     await navigator.serviceWorker.ready;
   });
-  await page.reload();
+  await expect.poll(() => page.evaluate(() => Boolean(navigator.serviceWorker.controller))).toBe(true);
   const registration = await page.evaluate(async () => {
     const ready = await navigator.serviceWorker.ready;
     return { scope: ready.scope, controlled: Boolean(navigator.serviceWorker.controller) };
@@ -55,7 +59,9 @@ test("serves install metadata and an offline shell", async ({ page, request }) =
   expect(registration.controlled).toBe(true);
 
   await page.context().setOffline(true);
-  await page.goto("/#logs").catch(() => undefined);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+  await page.getByRole("link", { name: "Logs" }).click();
   await expect(page.getByRole("heading", { name: "Logs" })).toBeVisible();
 });
 

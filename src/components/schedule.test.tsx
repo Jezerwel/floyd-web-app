@@ -77,7 +77,8 @@ describe("ScheduleView", () => {
     fireEvent.click(screen.getByLabelText("Monday"));
     fireEvent.click(screen.getByRole("button", { name: "Save schedule" }));
 
-    await waitFor(() => expect(transport.scheduleWrites).toHaveLength(1));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(transport.scheduleWrites).toHaveLength(1);
     expect(transport.scheduleWrites[0][0]).toMatchObject({
       label: "Morning feed",
       time: "08:30",
@@ -89,7 +90,6 @@ describe("ScheduleView", () => {
       postSpinMs: 1500,
       enabled: true,
     });
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     store.dispose();
   });
 });

@@ -9,6 +9,23 @@ import type { Schedule } from "./types";
 const TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 const DAY_PATTERN = /^(?:[0-6](?:,[0-6])*)?$/;
 
+export function isScheduleShape(value: unknown): value is Schedule {
+  if (!value || typeof value !== "object") return false;
+  const schedule = value as Partial<Schedule>;
+  return (
+    typeof schedule.id === "string" &&
+    typeof schedule.label === "string" &&
+    typeof schedule.time === "string" &&
+    typeof schedule.daysOfWeek === "string" &&
+    typeof schedule.augerSpeed === "number" &&
+    typeof schedule.impellerSpeed === "number" &&
+    typeof schedule.preSpinMs === "number" &&
+    typeof schedule.feedMs === "number" &&
+    typeof schedule.postSpinMs === "number" &&
+    typeof schedule.enabled === "boolean"
+  );
+}
+
 export function validateSchedule(schedule: Schedule): string[] {
   const errors: string[] = [];
   if (!schedule.id.trim()) errors.push("Schedule id is required.");

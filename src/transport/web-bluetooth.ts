@@ -14,6 +14,7 @@ import {
   decodeUtf8Json,
   encodeScheduleChunks,
   encodeTimeSync,
+  isScheduleShape,
   joinScheduleChunks,
   parseDeviceMessage,
 } from "@/protocol";
@@ -47,6 +48,7 @@ const CHARACTERISTIC_UUIDS = [
 type CharacteristicUuid = (typeof CHARACTERISTIC_UUIDS)[number];
 
 type Listener<T> = (value: T) => void;
+const SCHEDULE_CONFIRMATION_TIMEOUT_MS = 5_000;
 
 export interface WebBluetoothTransportOptions {
   bluetooth?: BluetoothApiLike;
@@ -117,6 +119,7 @@ export class WebBluetoothTransport implements FeederTransport {
   private characteristics: Partial<Record<CharacteristicUuid, BluetoothCharacteristicLike>> = {};
   private device: BluetoothDeviceLike | null = null;
   private manuallyDisconnecting = false;
+  private finishScheduleWrite: Listener<TransportError | null> | null = null;
 
   constructor(options: WebBluetoothTransportOptions = {}) {
     this.bluetooth = options.bluetooth ?? browserBluetooth();
@@ -135,6 +138,7 @@ export class WebBluetoothTransport implements FeederTransport {
       if (!gatt) {
         throw new TransportError("connection_failed", "The selected device has no GATT server.");
       }
+      this.device = device;
       const server = gatt.connect ? await gatt.connect() : gatt;
       const service = await server.getPrimaryService(FLOYD_BLE_SERVICE);
       const characteristics: Partial<Record<CharacteristicUuid, BluetoothCharacteristicLike>> = {};
@@ -142,14 +146,13 @@ export class WebBluetoothTransport implements FeederTransport {
         characteristics[uuid] = await service.getCharacteristic(uuid);
       }
 
-      this.device = device;
       this.characteristics = characteristics;
       this.deviceName = device.name ?? null;
       this.chipId = chipIdFromDeviceName(this.deviceName);
       this.attachDeviceDisconnect(device);
       await this.attachNotifications();
     } catch (error) {
-      await this.clearConnection(false, preserveDevice);
+      await this.clearConnection(true, preserveDevice);
       throw normalizeTransportError(error);
     }
   }
@@ -218,12 +221,39 @@ export class WebBluetoothTransport implements FeederTransport {
   async writeSchedules(schedules: Schedule[]): Promise<void> {
     const characteristic = this.requireCharacteristic(FLOYD_BLE_SCHEDULES);
     const chunks = encodeScheduleChunks(schedules);
+    if (this.finishScheduleWrite) {
+      throw new TransportError("command_failed", "A schedule save is already in progress.");
+    }
+    let finish!: Listener<TransportError | null>;
+    const confirmation = new Promise<TransportError | null>((resolve) => { finish = resolve; });
+    this.finishScheduleWrite = finish;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
       for (const chunk of chunks) {
+        if (this.finishScheduleWrite !== finish) {
+          throw new TransportError("not_connected", "Connection lost while saving schedules.");
+        }
         await characteristic.writeValueWithResponse(toArrayBuffer(chunk));
+      }
+      timeout = setTimeout(
+        () => finish(new TransportError("timeout", "The feeder did not confirm the schedule save.")),
+        SCHEDULE_CONFIRMATION_TIMEOUT_MS,
+      );
+      const error = await confirmation;
+      if (error) throw error;
+      if (this.finishScheduleWrite !== finish) {
+        throw new TransportError("not_connected", "Connection lost while saving schedules.");
+      }
+      // A confirmation from a timed-out upload can arrive during a later upload.
+      const saved = await this.readSchedules();
+      if (JSON.stringify(saved) !== JSON.stringify(schedules)) {
+        throw new TransportError("invalid_response", "The feeder's saved schedule list differs from this edit.");
       }
     } catch (error) {
       throw normalizeTransportError(error, "connection_failed");
+    } finally {
+      clearTimeout(timeout);
+      if (this.finishScheduleWrite === finish) this.finishScheduleWrite = null;
     }
   }
 
@@ -291,10 +321,10 @@ export class WebBluetoothTransport implements FeederTransport {
   private async attachNotifications(): Promise<void> {
     for (const uuid of FLOYD_BLE_NOTIFICATION_CHARACTERISTICS) {
       const characteristic = this.requireCharacteristic(uuid);
-      await characteristic.startNotifications();
       const listener = eventListener(this.handleCharacteristicValue);
       characteristic.addEventListener("characteristicvaluechanged", listener);
       this.characteristicListeners.set(characteristic, listener);
+      await characteristic.startNotifications();
     }
   }
 
@@ -304,10 +334,23 @@ export class WebBluetoothTransport implements FeederTransport {
     if (!value) return;
     const message = parseDeviceMessage(value);
     if (!message) return;
+    if (characteristic === this.characteristics[FLOYD_BLE_RESPONSE] &&
+      !Array.isArray(message.data) && message.data.action === "set_schedules") {
+      if (message.type === "control_response" && message.data.success === true) {
+        this.finishScheduleWrite?.(null);
+      } else if (message.type === "error" || message.type === "control_response") {
+        const reason = typeof message.data.message === "string"
+          ? message.data.message
+          : "The feeder rejected the schedule save.";
+        this.finishScheduleWrite?.(new TransportError("command_failed", reason));
+      }
+    }
     for (const listener of this.messages) listener(message);
   };
 
   private async clearConnection(disconnectGatt: boolean, preserveDevice = false): Promise<void> {
+    this.finishScheduleWrite?.(new TransportError("not_connected", "Connection lost while saving schedules."));
+    this.finishScheduleWrite = null;
     const device = this.device;
     if (device) {
       device.removeEventListener("gattserverdisconnected", this.handleDeviceDisconnect);
@@ -320,10 +363,7 @@ export class WebBluetoothTransport implements FeederTransport {
     if (!preserveDevice) this.device = null;
     if (disconnectGatt && device?.gatt?.connected) {
       try {
-        const server = device.gatt;
-        if (server && "disconnect" in server && typeof server.disconnect === "function") {
-          server.disconnect();
-        }
+        await device.gatt.disconnect?.();
       } catch {
         // A manual disconnect is complete even when the browser rejects the GATT call.
       }
@@ -362,21 +402,4 @@ async function readScheduleBytes(characteristic: BluetoothCharacteristicLike): P
     page = decodeScheduleChunk(dataViewBytes(await characteristic.readValue()));
   }
   throw new TransportError("invalid_response", "The feeder returned an incomplete schedule list.");
-}
-
-function isScheduleShape(value: unknown): value is Schedule {
-  if (!value || typeof value !== "object") return false;
-  const schedule = value as Partial<Schedule>;
-  return (
-    typeof schedule.id === "string" &&
-    typeof schedule.label === "string" &&
-    typeof schedule.time === "string" &&
-    typeof schedule.daysOfWeek === "string" &&
-    typeof schedule.augerSpeed === "number" &&
-    typeof schedule.impellerSpeed === "number" &&
-    typeof schedule.preSpinMs === "number" &&
-    typeof schedule.feedMs === "number" &&
-    typeof schedule.postSpinMs === "number" &&
-    typeof schedule.enabled === "boolean"
-  );
 }
